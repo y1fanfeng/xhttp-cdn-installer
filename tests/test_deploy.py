@@ -52,6 +52,27 @@ def hello(sni='cloudflare-ech.com', ech=True):
     return b'\x16\x03\1' + len(hand).to_bytes(2, 'big') + hand
 
 
+class SSHPortTests(unittest.TestCase):
+    def test_keyword_case_without_ssh_environment(self):
+        # sudo may remove SSH_CONNECTION. Both old and new OpenSSH output
+        # must independently identify the port, including non-default ports.
+        for keyword in ('port', 'Port', 'PORT'):
+            with self.subTest(keyword=keyword), patch.dict(d.os.environ, {}, clear=True), \
+                 patch.object(d, 'run', return_value=f'{keyword} 22\n{keyword} 2222\nListenAddress [::]:22'):
+                self.assertEqual(d.ssh_ports(), {22, 2222})
+
+    def test_current_session_port_is_also_preserved(self):
+        with patch.dict(d.os.environ, {'SSH_CONNECTION': '192.0.2.1 54321 192.0.2.2 2222'}, clear=True), \
+             patch.object(d, 'run', return_value='Port 22'):
+            self.assertEqual(d.ssh_ports(), {22, 2222})
+
+    def test_missing_or_invalid_ports_still_stop(self):
+        for output in ('', 'Port 0', 'Port 65536'):
+            with self.subTest(output=output), patch.dict(d.os.environ, {}, clear=True), \
+                 patch.object(d, 'run', return_value=output), self.assertRaises(d.Failure):
+                d.ssh_ports()
+
+
 class Tests(unittest.TestCase):
     def test_domain_injection_rejected(self):
         for bad in ['example.com;id', 'https://example.com', 'x/a.com', 'x\n.com', 'a..com', '-a.com']:
