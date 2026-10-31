@@ -222,7 +222,10 @@ def cache_rule(cf, zid, host, state):
     dump(STATE, state)
     existing = next((r for r in rs.get('rules', []) if r.get('ref') == ref), None)
     # Append/move only our rule; never replace the zone's whole ruleset.
-    rule['position'] = {'after': ''}
+    # Cloudflare rejects moving an already-last rule to the bottom (20011).
+    # Keep its position when updating it; new/non-last rules still go last.
+    if not existing or existing['id'] != rs['rules'][-1]['id']:
+        rule['position'] = {'after': ''}
     if existing:
         cf.api('PATCH', prefix + '/' + rs['id'] + '/rules/' + existing['id'], rule)
     else:
