@@ -1,0 +1,32 @@
+name: checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax and checksum
+        run: |
+          bash -n install.sh
+          python3 -m py_compile deploy.py
+          sha256sum -c SHA256SUMS
+      - name: Unit tests (no cloud credentials)
+        run: python3 -m unittest discover -s tests -v
+      - name: ShellCheck
+        run: shellcheck install.sh
+      - name: Download pinned core with checksum verification
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import deploy
+          deploy.BIN = Path('test-runtime/xray').resolve()
+          deploy.install_xray()
+          PY
+      - name: Real Xray integration tests
+        env:
+          XRAY_TEST_BINARY: ${{ github.workspace }}/test-runtime/xray
+        run: python3 -m unittest discover -s tests -v
