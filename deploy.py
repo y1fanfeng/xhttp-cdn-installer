@@ -31,13 +31,14 @@ import urllib.request
 import uuid
 import zipfile
 
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 XRAY_VERSION = '26.10.21'
 ROOT = Path('/etc/xhttp-cdn')
 STATE = ROOT / 'state.json'
 BIN = Path('/usr/local/lib/xhttp-cdn/xray')
 OUT = Path('/root/xhttp-cdn-nodes')
 NGINX = Path('/etc/nginx/sites-available/xhttp-cdn')
+UFW_FILES = ('/etc/default/ufw', '/etc/ufw/ufw.conf', '/etc/ufw/user.rules', '/etc/ufw/user6.rules')
 PRIVATE = ['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8',
            '169.254.0.0/16', '172.16.0.0/12', '192.168.0.0/16', '224.0.0.0/4',
            '240.0.0.0/4', '::/128', '::1/128', 'fc00::/7', 'fe80::/10', 'ff00::/8']
@@ -347,7 +348,81 @@ def get_networks():
     return networks
 
 
-def preflight(resume):
+def ssh_ports():
+    sshd = shutil.which('sshd') or '/usr/sbin/sshd'
+    ports = {int(p) for p in re.findall(r'^port (\d+)$', run(sshd, '-T', capture=True), re.M)}
+    if os.environ.get('SSH_CONNECTION'):
+        ports.add(int(os.environ['SSH_CONNECTION'].split()[-1]))
+    if not ports or any(not 1 <= p <= 65535 for p in ports):
+        raise Failure('无法确认 SSH 端口；未修改防火墙。')
+    return ports
+
+
+def ufw_guard():
+    # Installing Nginx adds an inert application profile, not an active rule.
+    config = {p: digest for p, digest in tree_fingerprints('/etc/ufw').items()
+              if 'applications.d' not in Path(p).parts}
+    return {**config, '/etc/default/ufw': fingerprint('/etc/default/ufw')}
+
+
+def audit_basic_ufw():
+    """Explicit opt-in for a reviewed, SSH-only UFW baseline; never reset it."""
+    status = run('ufw', 'status', 'verbose', capture=True)
+    if not re.search(r'^Status: active$', status, re.M) or not re.search(
+            r'^Default: deny \(incoming\), allow \(outgoing\), (?:disabled|deny) \(routed\)$', status, re.M):
+        raise Failure('--reuse-ufw 只支持已启用、默认拒绝入站/允许出站且不放行转发的基础 UFW。')
+    if not re.search(r'^IPV6=yes$', Path('/etc/default/ufw').read_text(), re.M):
+        raise Failure('--reuse-ufw 要求 UFW 已启用 IPv6 管理。')
+    ports = ssh_ports()
+    added = run('ufw', 'show', 'added', capture=True)
+    commands = [line.strip() for line in added.splitlines() if line.strip().startswith('ufw ')]
+    expected = {f'ufw allow {p}/tcp' for p in ports}
+    if not commands or set(commands) != expected:
+        raise Failure('--reuse-ufw 只接受与实际 SSH 端口一致的 ufw allow PORT/tcp 规则；其他规则需人工审查。')
+    # Cross-check the active IPv4/IPv6 rules, not only the persisted rule commands.
+    rows = re.split(r'^--\s+[- ]+$', status, maxsplit=1, flags=re.M)
+    if len(rows) != 2:
+        raise Failure('无法核验 UFW 活动规则表，停止。')
+    seen = set()
+    for line in rows[1].splitlines():
+        if not line.strip():
+            continue
+        m = re.fullmatch(r'\s*(\d+)/tcp\s+(\(v6\)\s+)?ALLOW IN\s+Anywhere( \(v6\))?\s*', line)
+        if not m or bool(m[2]) != bool(m[3]):
+            raise Failure('UFW 存在非基础 SSH 活动规则，停止。')
+        seen.add((int(m[1]), bool(m[2])))
+    if seen != {(p, v6) for p in ports for v6 in (False, True)}:
+        raise Failure('UFW 的 IPv4/IPv6 SSH 规则与实际 SSH 端口不一致，停止。')
+    return ufw_guard()
+
+
+def check_firewall_backend(reuse_ufw=False):
+    for cmd in ('iptables-save', 'ip6tables-save'):
+        if not shutil.which(cmd):
+            continue
+        raw = run(cmd, capture=True)
+        if not reuse_ufw:
+            if re.search(r'^-A |^:\S+ (DROP|REJECT)', raw, re.M):
+                raise Failure('已有 iptables 防火墙规则，停止以免影响现有服务。')
+            continue
+        for line in raw.splitlines():
+            if not line or line.startswith('#') or line == 'COMMIT':
+                continue
+            if line == '*filter' or re.fullmatch(r':(?:INPUT|OUTPUT|FORWARD) (?:ACCEPT|DROP) \[\d+:\d+\]', line):
+                continue
+            if re.fullmatch(r':ufw6?-[\w-]+ - \[\d+:\d+\]', line) or re.match(r'^-A ufw6?-[\w-]+ ', line):
+                continue
+            if re.fullmatch(r'-A (?:INPUT|OUTPUT|FORWARD) -j ufw6?-[\w-]+', line):
+                continue
+            raise Failure('检测到 UFW 之外或无法识别的 iptables 规则，不能自动复用。')
+    if shutil.which('nft'):
+        tables = run('nft', 'list', 'tables', capture=True)
+        allowed = {'table ip filter', 'table ip6 filter'} if reuse_ufw else set()
+        if any(line.strip() not in allowed for line in tables.splitlines() if line.strip()):
+            raise Failure('已有非本安装器支持的 nftables 表，停止以免影响现有服务。')
+
+
+def preflight(resume, reuse_ufw=False):
     if platform.system() != 'Linux' or os.geteuid() != 0:
         raise Failure('请在新 Linux VPS 上以 root 执行。')
     info = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
@@ -367,13 +442,16 @@ def preflight(resume):
         listeners = run('ss', '-H', '-ltn', capture=True)
         if re.search(r':(?:80|443|10000)\s', listeners):
             raise Failure('80、443 或 10000 端口已被占用，请使用新主机。')
-        if shutil.which('ufw') and 'Status: active' in run('ufw', 'status', capture=True):
-            raise Failure('检测到已启用 UFW，请先人工审查已有防火墙。')
-        for cmd in ('iptables-save', 'ip6tables-save'):
-            if shutil.which(cmd) and re.search(r'^-A |^:\S+ (DROP|REJECT)', run(cmd, capture=True), re.M):
-                raise Failure('已有 iptables 防火墙规则，停止以免影响现有服务。')
-        if shutil.which('nft') and run('nft', 'list', 'tables', capture=True):
-            raise Failure('已有 nftables 表，停止以免影响现有服务。')
+        if reuse_ufw:
+            if not shutil.which('ufw'):
+                raise Failure('--reuse-ufw 要求主机已有启用的 UFW。')
+            guard = audit_basic_ufw()
+        else:
+            guard = None
+            if shutil.which('ufw') and 'Status: active' in run('ufw', 'status', capture=True):
+                raise Failure('检测到已启用 UFW。若已审查并确认只有基础 SSH 放行，可使用 --reuse-ufw；不要关闭或重置防火墙。')
+        check_firewall_backend(reuse_ufw)
+        return guard
 
 
 def install_xray(s=None):
@@ -512,32 +590,47 @@ WantedBy=multi-user.target
     dump(STATE, s)
 
 
+def remember_ufw(s):
+    if 'ufw_before' not in s:
+        s['ufw_before'] = {p: base64.b64encode(Path(p).read_bytes()).decode() if Path(p).exists() else None for p in UFW_FILES}
+        s['ufw_was_active'] = 'Status: active' in run('ufw', 'status', capture=True)
+        s['ufw_after'] = {p: fingerprint(p) for p in UFW_FILES}
+        dump(STATE, s)
+
+
+def check_reused_ufw(s):
+    if s.get('reuse_ufw'):
+        if not s.get('ufw_guard') or ufw_guard() != s['ufw_guard']:
+            raise Failure('UFW 配置在核验后发生变化，停止自动修改；保留当前规则和安装状态。')
+        if 'Status: active' not in run('ufw', 'status', capture=True):
+            raise Failure('原先复用的 UFW 已停用，需人工检查后继续。')
+        check_firewall_backend(True)
+
+
 def firewall(s, networks):
-    sshd = shutil.which('sshd') or '/usr/sbin/sshd'
-    ports = {int(p) for p in re.findall(r'^port (\d+)$', run(sshd, '-T', capture=True), re.M)}
-    if os.environ.get('SSH_CONNECTION'):
-        ports.add(int(os.environ['SSH_CONNECTION'].split()[-1]))
-    if not ports or any(not 1 <= p <= 65535 for p in ports):
-        raise Failure('无法确认 SSH 端口；未启用防火墙。')
+    check_reused_ufw(s)
+    ports = ssh_ports()
     ufwc = Path('/etc/default/ufw').read_text()
     if not re.search(r'^IPV6=yes$', ufwc, re.M):
         raise Failure('UFW IPv6 未启用，请先启用以免漏掉 IPv6 入口。')
-    paths = ['/etc/default/ufw', '/etc/ufw/ufw.conf', '/etc/ufw/user.rules', '/etc/ufw/user6.rules']
-    if 'ufw_before' not in s:
-        s['ufw_before'] = {p: base64.b64encode(Path(p).read_bytes()).decode() if Path(p).exists() else None for p in paths}
-        s['ufw_was_active'] = 'Status: active' in run('ufw', 'status', capture=True)
-        dump(STATE, s)
+    remember_ufw(s)
+    if s.get('reuse_ufw') and sorted(ports) != s.get('ssh_ports'):
+        raise Failure('SSH 端口在核验后发生变化，停止自动修改 UFW。')
     try:
-        for p in sorted(ports):
-            run('ufw', 'allow', str(p) + '/tcp', 'comment', 'XHTTP-CDN preserve SSH')
+        if not s.get('reuse_ufw'):
+            for p in sorted(ports):
+                run('ufw', 'allow', str(p) + '/tcp', 'comment', 'XHTTP-CDN preserve SSH')
         for net in networks:
             run('ufw', 'allow', 'proto', 'tcp', 'from', net, 'to', 'any', 'port', '443',
                 'comment', 'XHTTP-CDN CF')
-        run('ufw', 'default', 'deny', 'incoming')
-        run('ufw', 'default', 'allow', 'outgoing')
-        run('ufw', '--force', 'enable')
+        if not s.get('reuse_ufw'):
+            run('ufw', 'default', 'deny', 'incoming')
+            run('ufw', 'default', 'allow', 'outgoing')
+            run('ufw', '--force', 'enable')
     finally:
-        s['ufw_after'] = {p: fingerprint(p) for p in paths}
+        s['ufw_after'] = {p: fingerprint(p) for p in UFW_FILES}
+        if s.get('reuse_ufw'):
+            s['ufw_guard'] = ufw_guard()
         dump(STATE, s)
     s['cf_networks'] = networks
     s['ssh_ports'] = sorted(ports)
@@ -819,6 +912,8 @@ def owned_path_allowed(path):
 
 
 def local_uninstall_check(s):
+    if s.get('reuse_ufw') and not s.get('ufw_restored'):
+        check_reused_ufw(s)
     if s.get('schema', 1) < 2:
         raise Failure('旧版安装没有完整归属清单，无法安全自动清理。请人工审查；不能靠升级推断历史软件归属。')
     if 'certificates_before' in s:
@@ -910,15 +1005,18 @@ def uninstall(s, keep_packages=False):
         if s.get('certificate_existed') is False and Path('/etc/letsencrypt/renewal/' + s['host'] + '.conf').exists():
             run('certbot', 'delete', '--non-interactive', '--cert-name', s['host'])
         if s.get('ufw_before') and not s.get('ufw_restored'):
-            run('ufw', '--force', 'disable')
+            if not s.get('reuse_ufw'):
+                run('ufw', '--force', 'disable')
             for name, content in s['ufw_before'].items():
-                if name not in ('/etc/default/ufw', '/etc/ufw/ufw.conf', '/etc/ufw/user.rules', '/etc/ufw/user6.rules'):
+                if name not in UFW_FILES:
                     raise Failure('未知 UFW 路径，停止恢复。')
                 if content is None:
                     Path(name).unlink(missing_ok=True)
                 else:
                     write(name, base64.b64decode(content), 0o640)
-            if s.get('ufw_was_active'):
+            if s.get('reuse_ufw'):
+                run('ufw', 'reload')
+            elif s.get('ufw_was_active'):
                 run('ufw', '--force', 'enable')
             s['ufw_restored'] = True
             dump(STATE, s)
@@ -964,10 +1062,13 @@ def main():
     group.add_argument('--status', action='store_true', help='查看服务和最后验证结果')
     group.add_argument('--uninstall', action='store_true', help='恢复 CF 设置、移除本次 VPS 配置和新增软件')
     parser.add_argument('--keep-packages', action='store_true', help='配合 --uninstall，仅清配置，保留 apt 软件包')
+    parser.add_argument('--reuse-ufw', action='store_true', help='复用已审查、仅放行实际 SSH 端口的已启用基础 UFW；保留规则和默认策略')
     parser.add_argument('--doh', default=None, help='ECH 配置查询 DoH URL，默认 https://dns.alidns.com/dns-query')
     args = parser.parse_args()
     if args.keep_packages and not args.uninstall:
         raise Failure('--keep-packages 只能与 --uninstall 一起使用。')
+    if args.reuse_ufw and any((args.uninstall, args.verify, args.export, args.status)):
+        raise Failure('--reuse-ufw 只用于安装；后续重复安装会自动沿用该选择。')
     if sys.version_info < (3, 10):
         raise Failure('需要 Python 3.10 或更高版本。')
     if platform.system() != 'Linux' or os.geteuid() != 0:
@@ -1002,7 +1103,11 @@ def main():
             print('注意：仅导出保存的配置，本次没有验证连通性。')
         export_nodes(s)
         return
-    preflight(s is not None)
+    if s and args.reuse_ufw and not s.get('reuse_ufw'):
+        raise Failure('不能用 --reuse-ufw 改变已有安装的防火墙管理方式。')
+    guard = preflight(s is not None, args.reuse_ufw)
+    if s:
+        check_reused_ufw(s)
     if not s:
         host = domain(input('节点完整域名（例如 node.example.com）：'))
         zone = domain(input('根域名 / CF Zone（例如 example.com）：'))
@@ -1015,11 +1120,15 @@ def main():
         s = {'schema': 2, 'host': host, 'zone': zone, 'ip': ip,
              'uuid': str(uuid.uuid4()), 'path': '/' + secrets.token_hex(20) + '/',
              'doh': 'https://dns.alidns.com/dns-query', 'installer_version': VERSION}
+        if guard is not None:
+            s.update(reuse_ufw=True, ufw_guard=guard, ssh_ports=sorted(ssh_ports()))
     if args.doh:
         s['doh'] = validate_doh(args.doh)
     print(f'目标：{s["host"]} → {s["ip"]}；传输模式 packet-up。')
     print('将修改该 CF 区域的 SSL/TLS 与 HTTP/2 设置，并创建节点记录和缓存绕过规则。')
     print('将安装服务、启用主机防火墙并保留 SSH；申请证书即同意 Let’s Encrypt 服务条款。')
+    if s.get('reuse_ufw'):
+        print('本次复用已有基础 UFW：保留现有 SSH 规则和默认策略，只追加 CF 的 443 回源放行。')
     if input('确认用于新/本脚本管理的 VPS，输入 YES 继续：') != 'YES':
         raise Failure('未执行安装。')
     token = token_input('Cloudflare 安装 API Token（隐藏输入）：')
@@ -1027,9 +1136,12 @@ def main():
     extra = getpass.getpass('续期专用 DNS Token（留空则保存同一个安装 Token）：').strip()
     if extra and not re.fullmatch(r'[A-Za-z0-9_-]{20,256}', extra):
         raise Failure('续期 Token 格式不正确。')
+    check_reused_ufw(s)
     ROOT.mkdir(mode=0o700, exist_ok=True)
     os.chmod(ROOT, 0o700)
     dump(STATE, s)
+    if s.get('reuse_ufw'):
+        remember_ufw(s)
     remember_packages(s)
     cf = CF(token)
     zone_setup(cf, s)
@@ -1070,5 +1182,8 @@ if __name__ == '__main__':
         sys.exit(130)
     except (Failure, OSError, ValueError, subprocess.SubprocessError, StopIteration, KeyError) as e:
         print('\n失败：' + str(e), file=sys.stderr)
-        print('未宣称安装成功。状态保存在 /etc/xhttp-cdn；不要删除后盲目重装。', file=sys.stderr)
+        if STATE.exists():
+            print('未宣称安装成功。状态保存在 /etc/xhttp-cdn；不要删除后盲目重装。', file=sys.stderr)
+        else:
+            print('安装在写入状态前停止，尚未创建安装状态；无需删除 /etc/xhttp-cdn。', file=sys.stderr)
         sys.exit(1)

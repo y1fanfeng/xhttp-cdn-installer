@@ -1,6 +1,6 @@
 # XHTTP-CDN 一键安装：VLESS + XHTTP + Cloudflare + ECH
 
-当前版本：**v1.1.0**，增加按安装归属清单卸载与恢复功能。
+当前版本：**v1.1.1**，支持显式复用仅放行 SSH 的基础 UFW，保留现有规则和默认策略；包含按安装归属清单卸载与恢复功能。
 
 输入节点域名和 Cloudflare API Token，在新的 Linux VPS 上自动部署，并输出普通 XHTTP、ECH 两份 VLESS 链接和二维码。两份配置共用一台 VPS，不是两条独立线路。
 
@@ -35,7 +35,7 @@ XHTTP 的 `auto` 模式 在 TLS HTTP/2 下通常选择 `stream-up`，依赖 Clou
 ## 2. 支持环境
 
 - **全新的** Debian 12/13、Ubuntu 22.04/24.04/26.04/26.10，x86_64 或 ARM64。
-- 正常运行 systemd，公网 IPv4，root 权限；不支持普通 Docker、仅 IPv6 或已安装网站/代理面板的服务器。
+- 正常运行 systemd，公网 IPv4，root 权限；不支持普通 Docker、仅 IPv6 或已安装网站/代理面板的服务器。云镜像预装且只放行 SSH 的基础 UFW 可按下文显式复用。
 - 推荐全新 Ubuntu 24.04 LTS。支持列表是脚本允许范围，不等于每种发行版均已实机验证。
 - VPS 能访问 GitHub、Cloudflare API、Let’s Encrypt、系统软件源和 DoH 服务。
 - 云平台安全组也必须允许 SSH 和 TCP 443 回源；脚本只配置主机 UFW，**不会操作 Vultr/AWS 的安全组**。如果你创建 VPS 时启用了云防火墙，需在云平台放行。
@@ -121,6 +121,22 @@ curl -fL "$BASE/install.sh" -o /root/xhttp-cdn-install.sh && bash /root/xhttp-cd
 ```
 
 如果系统没有 curl，先执行 `apt-get update && apt-get install -y curl ca-certificates`。普通 sudo 用户可以先 `sudo -i` 进入 root shell。不要直接 `curl ... | bash`：安装需要交互终端，Token 不应从管道读入。
+
+### 已启用基础 UFW 的新 VPS
+
+如果预检查提示 UFW 已启用，先查看 `sudo ufw status verbose`、`sudo ufw show added`、`sudo ss -lntp`。当主机只有实际 SSH 端口的 `ufw allow PORT/tcp` 规则（IPv4/IPv6 均放行）、默认拒绝入站/允许出站且不放行转发时，可以显式复用：
+
+```bash
+BASE='https://raw.githubusercontent.com/y1fanfeng/xhttp-cdn-installer/main'
+curl -fL "$BASE/install.sh" -o /root/xhttp-cdn-install.sh &&
+bash /root/xhttp-cdn-install.sh --source "$BASE" --reuse-ufw
+```
+
+- 不执行 UFW disable/reset，不改原有 SSH 规则或默认策略；只追加 Cloudflare 网段到 TCP 443 的放行。
+- 安装前保存防火墙基线，重复执行保留最初备份。卸载时恢复原配置并 reload，保持原防火墙启用。
+- 核验 IPv6、实际 SSH 端口、UFW 活动规则和已添加规则；发现额外端口、非 UFW 的 iptables 规则或其他 nftables 表会停止。已有服务/端口冲突检查仍有效。
+- 安装期间及后续执行前会检查防火墙文件是否发生额外改动。它不是任意自定义 UFW/底层规则的通用迁移器，不能用该参数跳过人工审查；保留的自定义 before/after 规则仍可能影响回源。
+- 不要通过关闭 UFW、重置规则或伪造安装状态绕过检查。尚未写入状态就停止时，新版本会明确提示，无需删除状态目录。
 
 ### 方式 B：下载仓库后运行
 
@@ -255,7 +271,7 @@ CF 清理失败时本地服务尚未删除，可以修复 Token 后重试。卸�
 - 403/挑战页：已有 WAF、Bot Fight、Under Attack 或 Access 策略可能阻止代理。脚本不会全局关闭这些保护，需要检查针对节点的策略；不承诺所有套餐/已有规则都能无人工处理。
 - 普通通过、ECH 失败：检查 ECH 开启情况、HTTPS DNS 记录、DoH、CF 边缘证书，运行 `--verify` 重试。不要把服务已启动误认为 ECH 成功。
 - 正常首页可以打开但节点不通：检查客户端 UUID、路径、packet-up 模式、内核版本以及 CF 规则。
-- 安装前已有 Nginx/Xray/防火墙时会停止。不要删除状态文件来绕过检测。
+- 安装前已有 Nginx/Xray/防火墙时默认停止；仅基础 SSH UFW 可用 `--reuse-ufw` 核验后复用。不要删除状态文件来绕过检测。
 
 `/etc/xhttp-cdn/state.json` 保存 UUID、路径、原 DNS/设置/缓存规则快照，以及软件、文件、防火墙归属记录；重复安装前的服务配置备份放在 `/etc/xhttp-cdn/backups/`。它们包含敏感信息，只限 root 读取。配置语法验证失败时恢复已有服务配置；**整套操作不具备跨系统事务回滚**，已安装软件、已创建 DNS、已签发证书不会在出错时自动撤销。安装中断可重试，或使用卸载模式。若进程被强制杀死、断电导致操作与记录不一致，可能需要人工核对，不能承诺所有中断都无人工处理。
 
