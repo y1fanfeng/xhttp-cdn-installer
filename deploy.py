@@ -350,7 +350,9 @@ def get_networks():
 
 def ssh_ports():
     sshd = shutil.which('sshd') or '/usr/sbin/sshd'
-    ports = {int(p) for p in re.findall(r'^port (\d+)$', run(sshd, '-T', capture=True), re.M)}
+    # OpenSSH versions differ in keyword case ("port" versus "Port").
+    # Do not rely on SSH_CONNECTION being preserved by sudo.
+    ports = {int(p) for p in re.findall(r'^port (\d+)$', run(sshd, '-T', capture=True), re.M | re.I)}
     if os.environ.get('SSH_CONNECTION'):
         ports.add(int(os.environ['SSH_CONNECTION'].split()[-1]))
     if not ports or any(not 1 <= p <= 65535 for p in ports):
