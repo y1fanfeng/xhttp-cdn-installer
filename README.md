@@ -56,6 +56,8 @@ XHTTP 的 `auto` 模式 在 TLS HTTP/2 下通常选择 `stream-up`，依赖 Clou
 
 ## 4. Cloudflare Token
 
+**截图教程：[配置 API Token 与查看 Account ID](docs/cloudflare-setup.md)**。包含创建入口、四项权限、区域范围、摘要核对和 Account ID 复制入口；图片不展示真实账户标识或凭据。
+
 在 Cloudflare 的个人资料 → API Tokens → Create Token → Custom Token 创建。不要使用 Global API Key，也不要把 Token 写进 GitHub 或命令行。
 
 对于**已经加入 CF 的域名**，建议权限：
