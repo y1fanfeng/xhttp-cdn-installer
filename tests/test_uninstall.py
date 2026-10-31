@@ -178,7 +178,7 @@ class UninstallTests(unittest.TestCase):
             with patch.object(d, 'ROOT', root), patch.object(d, 'STATE', root / 'state.json'), \
                  patch.object(d, 'OUT', out), patch.object(d, 'BIN', Path(td) / 'bin' / 'xray'), \
                  patch.object(d, 'run', return_value=''), patch.object(d, 'package_removal_plan', return_value=[]), \
-                 patch('builtins.input', return_value='UNINSTALL'):
+                 patch('builtins.input', return_value='  Uninstall  '):
                 d.dump(d.STATE, s)
                 d.uninstall(s)
                 self.assertFalse(d.STATE.exists())

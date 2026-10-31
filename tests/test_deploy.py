@@ -74,6 +74,32 @@ class SSHPortTests(unittest.TestCase):
 
 
 class Tests(unittest.TestCase):
+    def test_confirmation_words_accept_case_and_outer_whitespace(self):
+        for word in ('YES', 'REPLACE', 'UNINSTALL'):
+            for value in (word, word.lower(), word.title(), '  ' + word.lower() + '\t'):
+                with self.subTest(word=word, value=value), patch('builtins.input', return_value=value):
+                    self.assertTrue(d.confirm_input('confirm:', word))
+
+    def test_confirmation_words_still_require_explicit_correct_word(self):
+        for word in ('YES', 'REPLACE', 'UNINSTALL'):
+            for value in ('', ' ', 'y', 'no', word + ' extra', word[:2] + ' ' + word[2:]):
+                with self.subTest(word=word, value=value), patch('builtins.input', return_value=value):
+                    self.assertFalse(d.confirm_input('confirm:', word))
+        with patch('builtins.input', return_value='yes'):
+            self.assertFalse(d.confirm_input('confirm removal:', 'UNINSTALL'))
+
+    def test_token_input_preserves_credential_case(self):
+        token = 'TestOnly_MixedCase_1234567890'
+        with patch.object(d.getpass, 'getpass', return_value=' ' + token + '\n'):
+            self.assertEqual(d.token_input('token:'), token)
+
+    def test_new_zone_normalizes_hex_account_id(self):
+        cloud = FakeCF()
+        with patch.object(cloud, 'api', side_effect=[[], {'id': 'zone1', 'status': 'active'}]) as api, \
+             patch('builtins.input', return_value='  ' + 'AB' * 16 + '  '), patch.object(d, 'dump'):
+            d.zone_setup(cloud, {'zone': 'example.com'})
+        self.assertEqual(api.call_args.args[2]['account']['id'], 'ab' * 16)
+
     def test_domain_injection_rejected(self):
         for bad in ['example.com;id', 'https://example.com', 'x/a.com', 'x\n.com', 'a..com', '-a.com']:
             with self.subTest(bad=bad), self.assertRaises(d.Failure):
