@@ -31,7 +31,7 @@ import urllib.request
 import uuid
 import zipfile
 
-VERSION = '1.1.2'
+VERSION = '1.1.3'
 XRAY_VERSION = '26.10.21'
 ROOT = Path('/etc/xhttp-cdn')
 STATE = ROOT / 'state.json'
@@ -145,6 +145,11 @@ def domain(value):
     return value
 
 
+def confirm_input(label, expected):
+    """Normalize confirmation words only; never normalize credential case."""
+    return input(label).strip().casefold() == expected.casefold()
+
+
 def token_input(label):
     v = getpass.getpass(label).strip()
     if not re.fullmatch(r'[A-Za-z0-9_-]{20,256}', v):
@@ -180,7 +185,7 @@ def zone_setup(cf, s):
     if zones:
         z = zones[0]
     else:
-        account = input('域名尚未加入 CF。请输入 Cloudflare Account ID（32位）：').strip()
+        account = input('域名尚未加入 CF。请输入 Cloudflare Account ID（32位）：').strip().lower()
         if not re.fullmatch('[a-fA-F0-9]{32}', account):
             raise Failure('Account ID 不正确。')
         z = cf.api('POST', '/zones', {'name': s['zone'], 'account': {'id': account}, 'type': 'full'})
@@ -240,7 +245,7 @@ def cloudflare_setup(cf, s):
     if len(relevant) > 1 or (relevant and not a):
         raise Failure('节点名存在多个 A/AAAA 或 CNAME；请先整理该名称的记录，脚本不会删除它们。')
     if a and a[0]['content'] != s['ip'] and not s.get('dns_owned'):
-        if input(f'{s["host"]} 已指向其他 IP。输入 REPLACE 才替换：') != 'REPLACE':
+        if not confirm_input(f'{s["host"]} 已指向其他 IP。输入 REPLACE 才替换（不区分大小写）：', 'REPLACE'):
             raise Failure('保留原有 DNS，停止。')
     if 'dns_before' not in s:
         s['dns_before'] = relevant
@@ -985,7 +990,7 @@ def uninstall(s, keep_packages=False):
         cf = CF(token_input('用于 CF 清理的 API Token（隐藏输入，需要原安装权限）：'))
         ops = cf_uninstall_plan(cf, s)
         print('CF 待恢复/删除操作数：' + str(len(ops)))
-    if input('确认立即中断该节点并卸载，输入 UNINSTALL：') != 'UNINSTALL':
+    if not confirm_input('确认立即中断该节点并卸载，输入 UNINSTALL（不区分大小写）：', 'UNINSTALL'):
         raise Failure('未执行卸载。')
     s['uninstall_started'] = True
     dump(STATE, s)
@@ -1132,7 +1137,7 @@ def main():
     print('将安装服务、启用主机防火墙并保留 SSH；申请证书即同意 Let’s Encrypt 服务条款。')
     if s.get('reuse_ufw'):
         print('本次复用已有基础 UFW：保留现有 SSH 规则和默认策略，只追加 CF 的 443 回源放行。')
-    if input('确认用于新/本脚本管理的 VPS，输入 YES 继续：') != 'YES':
+    if not confirm_input('确认用于新/本脚本管理的 VPS，输入 YES 继续（不区分大小写）：', 'YES'):
         raise Failure('未执行安装。')
     token = token_input('Cloudflare 安装 API Token（隐藏输入）：')
     print('证书续期需要持久保存 Token，文件仅 root 可读。可另用仅此域名 DNS 编辑权限的 Token。')

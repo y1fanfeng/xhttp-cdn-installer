@@ -1,6 +1,6 @@
 # XHTTP-CDN 一键安装：VLESS + XHTTP + Cloudflare + ECH
 
-当前版本：**v1.1.2**，自动检测并复用仅放行 SSH 的基础 UFW，保留现有规则和默认策略；包含按安装归属清单卸载与恢复功能。
+当前版本：**v1.1.3**，确认词兼容大小写和首尾空格，兼容新版 OpenSSH 的端口输出，并修复重复更新末尾缓存规则时的错误；保留基础 UFW 自动兼容和按归属清单卸载功能。
 
 输入节点域名和 Cloudflare API Token，在新的 Linux VPS 上自动部署，并输出普通 XHTTP、ECH 两份 VLESS 链接和二维码。两份配置共用一台 VPS，不是两条独立线路。
 
@@ -60,20 +60,20 @@ XHTTP 的 `auto` 模式 在 TLS HTTP/2 下通常选择 `stream-up`，依赖 Clou
 
 在 Cloudflare 的个人资料 → API Tokens → Create Token → Custom Token 创建。不要使用 Global API Key，也不要把 Token 写进 GitHub 或命令行。
 
-对于**已经加入 CF 的域名**，建议权限：
+对于**完整自动安装（包括把新域名添加到 CF）**，配置以下四项权限；下方截图教程也按此流程演示：
 
 | 范围 | 权限 | 用途 |
 |---|---|---|
-| Zone | Zone / Read（区域读取） | 查找 Zone、检查激活状态 |
+| Zone | Zone / Edit（区域编辑） | 创建 Zone、查找 Zone、检查激活状态 |
 | Zone | DNS / Edit | 设置节点 A 记录、证书 TXT 验证 |
 | Zone | Zone Settings / Edit | Full(strict)、TLS、HTTP/2、ECH 设置 |
 | Zone | Cache Rules / Edit | 创建/更新节点缓存绕过规则 |
 
-Zone Resources 限制为你这一个域名。规则权限界面的名称可能有调整；脚本使用 Zone Rulesets 接口，不使用账户级 Filter Lists。如果报 403，按失败接口核对该端点要求，不要直接改成全账户管理员权限。
+自动创建新 Zone 时，资源范围必须覆盖目标账户中新建的区域；截图使用“包括 → 所有区域”，方便跨域名部署。仅限定某个已有区域无法创建另一个区域。这仍只授予表中的四项权限，不等于全账户管理员权限。规则权限界面的名称可能有调整；脚本使用 Zone Rulesets 接口，不使用账户级 Filter Lists。
 
-如果希望脚本**自动将全新域名添加到 CF**，还需要允许创建 Zone 的权限和足够资源范围：Zone / Edit，并选择目标账户范围内允许新 Zone 的资源范围。仅限定某个已有 Zone 的 Token 无法创建另一个 Zone。如果账户策略不允许，手动在 CF 添加域名，再使用上面的单域名 Token 即可。脚本只有在找不到域名时才询问 Account ID，不要求额外读取整个账户列表。
+如果**域名已经加入 CF**且只部署该域名，可将“Zone / Edit”缩小为“Zone / Read”，并把资源限制为该域名，其余三项仍为编辑。如果账户策略不允许自动创建 Zone，可先手动添加域名再使用此方案。Account ID 本身不授予权限；脚本只有在查询不到区域时才询问它，不要求额外读取整个账户列表。
 
-脚本在安装前说明整体变更并要求一次 `YES`；这是为了避免把安装器误运行在业务服务器上。它会更改**整个 Zone 的** SSL/TLS 和 HTTP/2 设置，不只影响 node 子域名。新买的专用域名最省事。
+脚本在安装前说明整体变更并要求一次 `YES`；这是为了避免把安装器误运行在业务服务器上。`YES`、`REPLACE`、`UNINSTALL` 均不区分大小写并忽略首尾空格，例如 `yes`、`Yes`、` uninstall ` 均可；空输入或只输入 `y` 不代表确认。域名和十六进制 Account ID 会规范为小写，API Token 保留原有大小写，不要手动转换凭据。脚本会更改**整个 Zone 的** SSL/TLS 和 HTTP/2 设置，不只影响 node 子域名。新买的专用域名最省事。
 
 ### 续期凭据
 
