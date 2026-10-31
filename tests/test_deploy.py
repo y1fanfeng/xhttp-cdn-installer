@@ -136,6 +136,28 @@ class Tests(unittest.TestCase):
             d.cache_rule(cf, 'z', host, {})
         self.assertEqual(cf.calls[-1][0], 'PATCH')
         self.assertTrue(cf.calls[-1][1].endswith('/rules/own'))
+        self.assertEqual(cf.calls[-1][2]['position'], {'after': ''})
+
+    def test_cache_resume_at_bottom_does_not_reposition_or_replace_baseline(self):
+        host = 'node.example.com'
+        ref = 'xhttp-cdn_' + hashlib.sha256(host.encode()).hexdigest()[:16]
+        own = {'id': 'own', 'ref': ref}
+        for rules in ([own], [{'id': 'other', 'ref': 'other-rule'}, own]):
+            with self.subTest(rules=rules):
+                cf = FakeCF(rules)
+                baseline = {'rules': [{'id': 'original-before-install'}]}
+                state = {'cache_before': copy.deepcopy(baseline)}
+                with patch.object(d, 'dump'):
+                    for _ in range(2):
+                        d.cache_rule(cf, 'z', host, state)
+                mutations = [x for x in cf.calls if x[0] != 'GET']
+                self.assertEqual(len(mutations), 2)
+                for method, path, body in mutations:
+                    self.assertEqual(method, 'PATCH')
+                    self.assertTrue(path.endswith('/rules/own'))
+                    self.assertNotIn('position', body)
+                    self.assertEqual(body['action_parameters'], {'cache': False})
+                self.assertEqual(state['cache_before'], baseline)
 
     def test_cache_404_creates_but_403_does_not(self):
         cf = FakeCF(error=404)
