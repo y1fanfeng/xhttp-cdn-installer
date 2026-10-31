@@ -181,6 +181,101 @@ class Tests(unittest.TestCase):
                 d.write(Path(td) / 'link', 'bad')
 
 
+class FirewallTests(unittest.TestCase):
+    status = ('Status: active\nLogging: on (low)\n'
+              'Default: deny (incoming), allow (outgoing), disabled (routed)\n'
+              'New profiles: skip\n\nTo                         Action      From\n'
+              '--                         ------      ----\n'
+              '22/tcp                     ALLOW IN    Anywhere\n'
+              '22/tcp (v6)                ALLOW IN    Anywhere (v6)\n')
+    backend = ('*filter\n:INPUT DROP [0:0]\n:OUTPUT ACCEPT [0:0]\n:FORWARD DROP [0:0]\n'
+               ':ufw-before-input - [0:0]\n:ufw-user-input - [0:0]\n'
+               '-A INPUT -j ufw-before-input\n'
+               '-A ufw-user-input -p tcp -m tcp --dport 22 -j ACCEPT\nCOMMIT\n')
+
+    def audit(self, status=None, added='Added user rules:\nufw allow 22/tcp'):
+        with patch.object(d, 'run', side_effect=[status or self.status, added]), \
+             patch.object(d, 'ssh_ports', return_value={22}), \
+             patch.object(d.Path, 'read_text', return_value='IPV6=yes\n'), \
+             patch.object(d, 'ufw_guard', return_value={'file': 'original'}):
+            return d.audit_basic_ufw()
+
+    def test_basic_dual_stack_ssh_is_accepted(self):
+        self.assertEqual(self.audit(), {'file': 'original'})
+
+    def test_fresh_preflight_requires_explicit_reuse_flag(self):
+        with patch.object(d.platform, 'system', return_value='Linux'), \
+             patch.object(d.os, 'geteuid', return_value=0, create=True), \
+             patch.object(d.Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="26.10"'), \
+             patch.object(d.Path, 'exists', autospec=True, side_effect=lambda p: str(p).replace('\\', '/') == '/run/systemd/system'), \
+             patch.object(d.shutil, 'which', return_value='present'), \
+             patch.object(d, 'run', side_effect=lambda *a, **kw: '' if a[0] == 'ss' else 'Status: active'), \
+             patch.object(d, 'audit_basic_ufw', return_value={'file': 'original'}) as audit, \
+             patch.object(d, 'check_firewall_backend'):
+            with self.assertRaisesRegex(d.Failure, '--reuse-ufw'):
+                d.preflight(False)
+            audit.assert_not_called()
+            self.assertEqual(d.preflight(False, True), {'file': 'original'})
+
+    def test_broad_port_or_mismatched_live_rules_rejected(self):
+        for added in ('ufw allow 22/tcp\nufw allow 443/tcp', 'ufw allow OpenSSH', 'ufw allow 2222/tcp', ''):
+            with self.subTest(added=added), self.assertRaises(d.Failure):
+                self.audit(added=added)
+        for status in (self.status.replace('deny (incoming)', 'allow (incoming)'),
+                       self.status.replace('22/tcp (v6)', '443/tcp (v6)'),
+                       self.status.replace('22/tcp (v6)                ALLOW IN    Anywhere (v6)\n', ''),
+                       self.status + '443/tcp ALLOW IN Anywhere\n'):
+            with self.subTest(status=status), self.assertRaises(d.Failure):
+                self.audit(status=status)
+
+    def test_ufw_backend_is_allowed_but_other_managers_rejected(self):
+        with patch.object(d.shutil, 'which', return_value='present'), \
+             patch.object(d, 'run', side_effect=[self.backend, self.backend.replace('ufw-', 'ufw6-'), 'table ip filter\ntable ip6 filter']):
+            d.check_firewall_backend(True)
+        for raw in (self.backend + '*nat\nCOMMIT', self.backend + ':DOCKER - [0:0]',
+                    self.backend + '-A INPUT -p tcp --dport 443 -j ACCEPT'):
+            with self.subTest(raw=raw), patch.object(d.shutil, 'which', return_value='present'), \
+                 patch.object(d, 'run', return_value=raw), self.assertRaises(d.Failure):
+                d.check_firewall_backend(True)
+        with patch.object(d.shutil, 'which', return_value='present'), \
+             patch.object(d, 'run', side_effect=[self.backend, self.backend, 'table inet other']), \
+             self.assertRaises(d.Failure):
+            d.check_firewall_backend(True)
+        with patch.object(d.shutil, 'which', return_value='present'), \
+             patch.object(d, 'run', return_value=self.backend), self.assertRaises(d.Failure):
+            d.check_firewall_backend(False)
+
+    def test_changed_baseline_stops_before_any_mutation(self):
+        with patch.object(d, 'ufw_guard', return_value={'file': 'changed'}), patch.object(d, 'run') as run:
+            with self.assertRaises(d.Failure):
+                d.firewall({'reuse_ufw': True, 'ufw_guard': {'file': 'original'}}, ['192.0.2.0/24'])
+            run.assert_not_called()
+
+    def test_reuse_only_adds_cf_rules_and_keeps_initial_backup_on_retry(self):
+        s = {'reuse_ufw': True, 'ufw_guard': {'file': 'original'}, 'ssh_ports': [22],
+             'ufw_before': {'file': 'original bytes'}, 'ufw_was_active': True}
+        def command(*args, **kwargs):
+            return 'Status: active' if args[:2] == ('ufw', 'status') else ''
+        with patch.object(d, 'ufw_guard', return_value={'file': 'original'}), \
+             patch.object(d, 'check_firewall_backend'), patch.object(d, 'ssh_ports', return_value={22}), \
+             patch.object(d.Path, 'read_text', return_value='IPV6=yes\n'), \
+             patch.object(d, 'fingerprint', return_value='hash'), patch.object(d, 'dump'), \
+             patch.object(d, 'run', side_effect=command) as run:
+            for _ in range(2):
+                d.firewall(s, ['192.0.2.0/24', '2001:db8::/32'])
+        changes = [call.args for call in run.call_args_list if call.args[:2] != ('ufw', 'status')]
+        self.assertEqual(len(changes), 4)
+        self.assertTrue(all(cmd[:4] == ('ufw', 'allow', 'proto', 'tcp') and '443' in cmd for cmd in changes))
+        self.assertEqual(s['ufw_before'], {'file': 'original bytes'})
+        self.assertTrue(s['ufw_was_active'])
+
+    def test_application_profile_does_not_change_active_config_guard(self):
+        with patch.object(d, 'tree_fingerprints', return_value={
+                '/etc/ufw/user.rules': 'rules', '/etc/ufw/applications.d/nginx': 'profile'}), \
+             patch.object(d, 'fingerprint', return_value='defaults'):
+            self.assertEqual(d.ufw_guard(), {'/etc/ufw/user.rules': 'rules', '/etc/default/ufw': 'defaults'})
+
+
 @unittest.skipUnless(os.environ.get('XRAY_TEST_BINARY'), 'Set XRAY_TEST_BINARY for real core integration')
 class CoreTests(unittest.TestCase):
     def test_real_core_validates_all_configs(self):

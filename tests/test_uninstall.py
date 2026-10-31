@@ -1,3 +1,4 @@
+import base64
 import copy
 import hashlib
 import sys
@@ -184,6 +185,24 @@ class UninstallTests(unittest.TestCase):
             self.assertFalse(credentials.exists())
             self.assertFalse(own.exists())
             self.assertEqual(other.read_text(), 'must survive')
+
+    def test_reused_ufw_uninstall_restores_rules_without_disabling_firewall(self):
+        s = state()
+        s.update(cf_removed=True, reuse_ufw=True, ufw_was_active=True,
+                 ufw_before={'/etc/ufw/user.rules': base64.b64encode(b'original SSH rules').decode()})
+        with tempfile.TemporaryDirectory() as td, patch.object(d, 'ROOT', Path(td) / 'state'), \
+             patch.object(d, 'STATE', Path(td) / 'state' / 'state.json'), \
+             patch.object(d, 'OUT', Path(td) / 'nodes'), patch.object(d, 'BIN', Path(td) / 'bin' / 'xray'), \
+             patch.object(d, 'local_uninstall_check'), patch.object(d, 'package_removal_plan', return_value=[]), \
+             patch.object(d, 'write') as write, patch.object(d, 'run', return_value='') as run, \
+             patch('builtins.input', return_value='UNINSTALL'):
+            d.STATE.parent.mkdir()
+            d.STATE.write_text('{}')
+            d.uninstall(s)
+        write.assert_any_call('/etc/ufw/user.rules', b'original SSH rules', 0o640)
+        calls = [call.args for call in run.call_args_list if call.args[0] == 'ufw']
+        self.assertEqual(calls, [('ufw', 'reload')])
+        self.assertTrue(s['ufw_restored'])
 
 
 if __name__ == '__main__':
