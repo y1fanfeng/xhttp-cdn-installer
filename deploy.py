@@ -31,7 +31,7 @@ import urllib.request
 import uuid
 import zipfile
 
-VERSION = '1.1.1'
+VERSION = '1.1.2'
 XRAY_VERSION = '26.10.21'
 ROOT = Path('/etc/xhttp-cdn')
 STATE = ROOT / 'state.json'
@@ -366,19 +366,19 @@ def ufw_guard():
 
 
 def audit_basic_ufw():
-    """Explicit opt-in for a reviewed, SSH-only UFW baseline; never reset it."""
+    """Validate an active, SSH-only UFW baseline before automatic reuse."""
     status = run('ufw', 'status', 'verbose', capture=True)
     if not re.search(r'^Status: active$', status, re.M) or not re.search(
             r'^Default: deny \(incoming\), allow \(outgoing\), (?:disabled|deny) \(routed\)$', status, re.M):
-        raise Failure('--reuse-ufw 只支持已启用、默认拒绝入站/允许出站且不放行转发的基础 UFW。')
+        raise Failure('自动复用只支持已启用、默认拒绝入站/允许出站且不放行转发的基础 UFW。')
     if not re.search(r'^IPV6=yes$', Path('/etc/default/ufw').read_text(), re.M):
-        raise Failure('--reuse-ufw 要求 UFW 已启用 IPv6 管理。')
+        raise Failure('自动复用要求 UFW 已启用 IPv6 管理。')
     ports = ssh_ports()
     added = run('ufw', 'show', 'added', capture=True)
     commands = [line.strip() for line in added.splitlines() if line.strip().startswith('ufw ')]
     expected = {f'ufw allow {p}/tcp' for p in ports}
     if not commands or set(commands) != expected:
-        raise Failure('--reuse-ufw 只接受与实际 SSH 端口一致的 ufw allow PORT/tcp 规则；其他规则需人工审查。')
+        raise Failure('自动复用只接受与实际 SSH 端口一致的 ufw allow PORT/tcp 规则；其他规则需人工审查。')
     # Cross-check the active IPv4/IPv6 rules, not only the persisted rule commands.
     rows = re.split(r'^--\s+[- ]+$', status, maxsplit=1, flags=re.M)
     if len(rows) != 2:
@@ -442,15 +442,13 @@ def preflight(resume, reuse_ufw=False):
         listeners = run('ss', '-H', '-ltn', capture=True)
         if re.search(r':(?:80|443|10000)\s', listeners):
             raise Failure('80、443 或 10000 端口已被占用，请使用新主机。')
-        if reuse_ufw:
-            if not shutil.which('ufw'):
-                raise Failure('--reuse-ufw 要求主机已有启用的 UFW。')
-            guard = audit_basic_ufw()
-        else:
-            guard = None
-            if shutil.which('ufw') and 'Status: active' in run('ufw', 'status', capture=True):
-                raise Failure('检测到已启用 UFW。若已审查并确认只有基础 SSH 放行，可使用 --reuse-ufw；不要关闭或重置防火墙。')
-        check_firewall_backend(reuse_ufw)
+        active_ufw = bool(shutil.which('ufw') and 'Status: active' in run('ufw', 'status', capture=True))
+        if reuse_ufw and not active_ufw:
+            raise Failure('--reuse-ufw 要求主机已有启用的 UFW；普通安装请省略此兼容参数。')
+        guard = audit_basic_ufw() if active_ufw else None
+        check_firewall_backend(active_ufw)
+        if active_ufw:
+            print('已自动识别并核验基础 SSH UFW，将保留原有规则和默认策略。')
         return guard
 
 
@@ -1062,7 +1060,7 @@ def main():
     group.add_argument('--status', action='store_true', help='查看服务和最后验证结果')
     group.add_argument('--uninstall', action='store_true', help='恢复 CF 设置、移除本次 VPS 配置和新增软件')
     parser.add_argument('--keep-packages', action='store_true', help='配合 --uninstall，仅清配置，保留 apt 软件包')
-    parser.add_argument('--reuse-ufw', action='store_true', help='复用已审查、仅放行实际 SSH 端口的已启用基础 UFW；保留规则和默认策略')
+    parser.add_argument('--reuse-ufw', action='store_true', help='兼容旧命令：要求复用已启用的基础 SSH UFW；默认安装已自动检测，无需此参数')
     parser.add_argument('--doh', default=None, help='ECH 配置查询 DoH URL，默认 https://dns.alidns.com/dns-query')
     args = parser.parse_args()
     if args.keep_packages and not args.uninstall:
