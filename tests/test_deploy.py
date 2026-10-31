@@ -1,4 +1,5 @@
 import copy
+from contextlib import contextmanager
 import hashlib
 import http.server
 import importlib.util
@@ -203,19 +204,53 @@ class FirewallTests(unittest.TestCase):
     def test_basic_dual_stack_ssh_is_accepted(self):
         self.assertEqual(self.audit(), {'file': 'original'})
 
-    def test_fresh_preflight_requires_explicit_reuse_flag(self):
+    @contextmanager
+    def preflight_env(self, active=True, installed=True):
         with patch.object(d.platform, 'system', return_value='Linux'), \
              patch.object(d.os, 'geteuid', return_value=0, create=True), \
              patch.object(d.Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="26.10"'), \
              patch.object(d.Path, 'exists', autospec=True, side_effect=lambda p: str(p).replace('\\', '/') == '/run/systemd/system'), \
-             patch.object(d.shutil, 'which', return_value='present'), \
-             patch.object(d, 'run', side_effect=lambda *a, **kw: '' if a[0] == 'ss' else 'Status: active'), \
+             patch.object(d.shutil, 'which', return_value='present' if installed else None), \
+             patch.object(d, 'run', side_effect=lambda *a, **kw: '' if a[0] == 'ss' else
+                          ('Status: active' if active else 'Status: inactive')), \
              patch.object(d, 'audit_basic_ufw', return_value={'file': 'original'}) as audit, \
-             patch.object(d, 'check_firewall_backend'):
-            with self.assertRaisesRegex(d.Failure, '--reuse-ufw'):
-                d.preflight(False)
-            audit.assert_not_called()
+             patch.object(d, 'check_firewall_backend') as backend:
+            yield audit, backend
+
+    def test_default_preflight_selects_active_inactive_or_missing_ufw(self):
+        for installed, active in ((True, True), (True, False), (False, False)):
+            with self.subTest(installed=installed, active=active), self.preflight_env(active, installed) as (audit, backend):
+                result = d.preflight(False)
+                self.assertEqual(result, {'file': 'original'} if active else None)
+                self.assertEqual(audit.call_count, int(active))
+                backend.assert_called_once_with(active)
+
+    def test_legacy_reuse_flag_still_requires_active_ufw(self):
+        with self.preflight_env() as (audit, backend):
             self.assertEqual(d.preflight(False, True), {'file': 'original'})
+            audit.assert_called_once()
+        with self.preflight_env(active=False) as (audit, backend):
+            with self.assertRaisesRegex(d.Failure, '--reuse-ufw'):
+                d.preflight(False, True)
+            audit.assert_not_called()
+            backend.assert_not_called()
+
+    def test_auto_detection_never_falls_back_after_failed_audit(self):
+        with self.preflight_env() as (audit, backend):
+            audit.side_effect = d.Failure('extra rules')
+            with self.assertRaisesRegex(d.Failure, 'extra rules'):
+                d.preflight(False)
+            backend.assert_not_called()
+        with self.preflight_env() as (audit, backend):
+            backend.side_effect = d.Failure('foreign firewall')
+            with self.assertRaisesRegex(d.Failure, 'foreign firewall'):
+                d.preflight(False)
+
+    def test_resume_does_not_reclassify_existing_installation(self):
+        with self.preflight_env() as (audit, backend):
+            self.assertIsNone(d.preflight(True))
+            audit.assert_not_called()
+            backend.assert_not_called()
 
     def test_broad_port_or_mismatched_live_rules_rejected(self):
         for added in ('ufw allow 22/tcp\nufw allow 443/tcp', 'ufw allow OpenSSH', 'ufw allow 2222/tcp', ''):
